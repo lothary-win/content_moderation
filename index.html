@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>Wort-Scanner</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    :root { color-scheme: dark; --bg:#111827; --panel:#1f2937; --muted:#9ca3af; }
+    * { box-sizing:border-box; }
+    html, body { margin:0; min-height:100%; background:var(--bg); color:#f9fafb; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    body { padding: max(12px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
+    main { width:min(100%, 850px); margin:0 auto; display:flex; flex-direction:column; gap:12px; }
+    h1 { font-size:clamp(1.35rem, 4vw, 2rem); margin:0; text-align:center; }
+    .sub { margin:0; color:var(--muted); text-align:center; font-size:.92rem; }
+    .camera-wrap { position:relative; overflow:hidden; background:#030712; border-radius:18px; border:1px solid #374151; height:min(48dvh, 440px); min-height:190px; display:flex; align-items:center; justify-content:center; }
+    video { display:block; width:100%; height:100%; object-fit:contain; }
+    .aim { position:absolute; inset:15% 7%; border:2px solid #ffffff8c; border-radius:12px; pointer-events:none; box-shadow:0 0 0 999px #00000012; }
+    .controls { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+    button { border:0; border-radius:12px; padding:13px 20px; min-height:48px; font-size:1rem; font-weight:700; cursor:pointer; touch-action:manipulation; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    #startBtn { background:#2563eb; color:white; }
+    #stopBtn { background:#374151; color:white; }
+    #status { display:none; padding:14px 12px; text-align:center; border-radius:14px; font-size:clamp(1.25rem, 5vw, 2rem); font-weight:900; letter-spacing:.02em; }
+    #status.blocked { display:block; color:#fff; background:#b91c1c; border:2px solid #f87171; }
+    #status.posted { display:block; color:#052e16; background:#86efac; border:2px solid #22c55e; }
+    #info { min-height:1.3em; color:#d1d5db; font-size:.9rem; text-align:center; overflow-wrap:anywhere; }
+    .hint { color:var(--muted); font-size:.82rem; text-align:center; margin:0; }
+    @media (orientation:landscape) and (max-height:600px) {
+      main { gap:8px; }
+      h1 { font-size:1.25rem; }
+      .sub { font-size:.8rem; }
+      .camera-wrap { height:48dvh; min-height:130px; }
+      button { min-height:42px; padding:9px 16px; }
+      #status { padding:8px; font-size:1.3rem; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Wort-Scanner</h1>
+  <p class="sub">Kamera auf den Text richten</p>
+
+  <div class="camera-wrap">
+    <video id="video" autoplay muted playsinline></video>
+    <div class="aim" aria-hidden="true"></div>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">Kamera starten</button>
+    <button id="stopBtn" disabled>Stoppen</button>
+  </div>
+
+  <div id="status" role="status" aria-live="assertive"></div>
+  <div id="info">Tippe auf „Kamera starten“, um zu beginnen.</div>
+  <p class="hint">Die Erkennung kann je nach Licht, Fokus und Schrift variieren.</p>
+</main>
+
+<script>
+(() => {
+  const video = document.getElementById("video");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const statusEl = document.getElementById("status");
+  const infoEl = document.getElementById("info");
+
+  let stream = null;
+  let worker = null;
+  let running = false;
+  let scanning = false;
+  let scanTimer = null;
+  let lastStatus = "";
+  let lastStatusAt = 0;
+  let lastTextAt = 0;
+
+  function setInfo(message) {
+    infoEl.textContent = message;
+  }
+
+  function clearStatus() {
+    statusEl.textContent = "";
+    statusEl.className = "";
+  }
+
+  function showStatus(type, message) {
+    const now = Date.now();
+    // Keep the same result visible briefly instead of flickering each scan.
+    if (lastStatus !== type || now - lastStatusAt > 1500) {
+      statusEl.textContent = message;
+      statusEl.className = type;
+      lastStatus = type;
+      lastStatusAt = now;
+    }
+  }
+
+  function normalizeText(text) {
+    return (text || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/0/g, "o")
+      .replace(/1/g, "l")
+      .replace(/[^a-z]/g, "");
+  }
+
+  function levenshtein(a, b) {
+    const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const curr = [i];
+      for (let j = 1; j <= b.length; j++) {
+        curr[j] = Math.min(
+          curr[j - 1] + 1,
+          prev[j] + 1,
+          prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+      }
+      prev.splice(0, prev.length, ...curr);
+    }
+    return prev[b.length];
+  }
+
+  function containsTarget(text) {
+    const normalized = normalizeText(text);
+    if (normalized.includes("schlange") || normalized.includes("schalnge")) {
+      return true;
+    }
+
+    // Compare character windows so longer words containing the target are covered.
+    // One OCR character error is tolerated; the common transposition "schalnge"
+    // is also checked explicitly above.
+    const targets = ["schlange", "schalnge"];
+    for (const target of targets) {
+      for (let start = 0; start < normalized.length; start++) {
+        for (let len = 7; len <= 9; len++) {
+          const part = normalized.slice(start, start + len);
+          if (part.length >= 7 && levenshtein(part, target) <= 1) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function makeVariants(videoEl) {
+    const sourceW = videoEl.videoWidth;
+    const sourceH = videoEl.videoHeight;
+    if (!sourceW || !sourceH) return [];
+
+    // Keep OCR workload manageable on iPad while retaining readable detail.
+    const scale = Math.min(1, 1800 / sourceW);
+    const w = Math.max(1, Math.round(sourceW * scale));
+    const h = Math.max(1, Math.round(sourceH * scale));
+
+    const base = document.createElement("canvas");
+    base.width = w;
+    base.height = h;
+    const bctx = base.getContext("2d", { willReadFrequently: true });
+    bctx.drawImage(videoEl, 0, 0, w, h);
+
+    const gray = document.createElement("canvas");
+    gray.width = w;
+    gray.height = h;
+    const gctx = gray.getContext("2d", { willReadFrequently: true });
+    gctx.drawImage(base, 0, 0);
+    const image = gctx.getImageData(0, 0, w, h);
+    const px = image.data;
+
+    // Grayscale + contrast enhancement.
+    for (let i = 0; i < px.length; i += 4) {
+      const v = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      const contrast = Math.max(0, Math.min(255, (v - 128) * 1.45 + 128));
+      px[i] = px[i + 1] = px[i + 2] = contrast;
+    }
+    gctx.putImageData(image, 0, 0);
+
+    const bw = document.createElement("canvas");
+    bw.width = w;
+    bw.height = h;
+    const bwctx = bw.getContext("2d", { willReadFrequently: true });
+    bwctx.drawImage(gray, 0, 0);
+    const bwImage = bwctx.getImageData(0, 0, w, h);
+    const bp = bwImage.data;
+    for (let i = 0; i < bp.length; i += 4) {
+      const value = bp[i] > 155 ? 255 : 0;
+      bp[i] = bp[i + 1] = bp[i + 2] = value;
+    }
+    bwctx.putImageData(bwImage, 0, 0);
+
+    return [base, gray, bw];
+  }
+
+  async function recognize(canvas) {
+    const result = await worker.recognize(canvas);
+    return {
+      text: result.data.text || "",
+      confidence: Number(result.data.confidence || 0)
+    };
+  }
+
+  async function scan() {
+    if (!running || scanning || !worker || video.readyState < 2) return;
+    scanning = true;
+
+    try {
+      const variants = makeVariants(video);
+      if (!variants.length) return;
+
+      let combinedText = "";
+      let bestConfidence = 0;
+      let foundTarget = false;
+      let readable = false;
+
+      // OCR all variants. Any target hit wins; combine text from every pass.
+      for (let i = 0; i < variants.length; i++) {
+        if (!running) break;
+        const result = await recognize(variants[i]);
+        combinedText += "\n" + result.text;
+        bestConfidence = Math.max(bestConfidence, result.confidence);
+        if (result.text.trim()) readable = true;
+        if (containsTarget(result.text)) foundTarget = true;
+
+        // If target already found, no need to spend time on more variants.
+        if (foundTarget) break;
+      }
+
+      if (!running) return;
+
+      if (!readable || !combinedText.trim()) {
+        if (Date.now() - lastTextAt > 1200) {
+          clearStatus();
+          lastStatus = "";
+        }
+        setInfo("Noch kein lesbarer Text erkannt …");
+        return;
+      }
+
+      lastTextAt = Date.now();
+
+      if (foundTarget || containsTarget(combinedText)) {
+        showStatus("blocked", "✕ BLOCKIERT");
+        setInfo("Passender Begriff erkannt.");
+      } else {
+        showStatus("posted", "✓ GEPOSTET");
+        setInfo("Text erkannt · OCR-Sicherheit: " + Math.round(bestConfidence) + "%");
+      }
+    } catch (err) {
+      console.error(err);
+      setInfo("Fehler bei der Texterkennung. Bitte erneut versuchen.");
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function startCamera() {
+    if (running) return;
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      setInfo("Kamerazugriff benötigt HTTPS. Öffne die Seite über GitHub Pages oder eine andere HTTPS-Adresse.");
+      return;
+    }
+
+    startBtn.disabled = true;
+    setInfo("Kamera wird gestartet …");
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      setInfo("OCR wird geladen …");
+      worker = await Tesseract.createWorker("deu");
+      await worker.setParameters({
+        preserve_interword_spaces: "1"
+      });
+
+      running = true;
+      stopBtn.disabled = false;
+      setInfo("Scanne laufend …");
+      scan();
+      scanTimer = window.setInterval(scan, 900);
+    } catch (err) {
+      console.error(err);
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      video.srcObject = null;
+      if (worker) {
+        try { await worker.terminate(); } catch (_) {}
+        worker = null;
+      }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+
+      if (err?.name === "NotAllowedError") {
+        setInfo("Kamerazugriff verweigert. Erlaube Kamera in den Safari-Einstellungen.");
+      } else if (err?.name === "NotFoundError") {
+        setInfo("Keine passende Kamera gefunden.");
+      } else {
+        setInfo("Start fehlgeschlagen: " + (err?.message || "Unbekannter Fehler"));
+      }
+    }
+  }
+
+  async function stopCamera() {
+    running = false;
+    if (scanTimer) {
+      clearInterval(scanTimer);
+      scanTimer = null;
+    }
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+    if (worker) {
+      try { await worker.terminate(); } catch (_) {}
+      worker = null;
+    }
+    scanning = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    clearStatus();
+    lastStatus = "";
+    setInfo("Gestoppt. Tippe auf „Kamera starten“, um erneut zu scannen.");
+  }
+
+  startBtn.addEventListener("click", startCamera);
+  stopBtn.addEventListener("click", stopCamera);
+  window.addEventListener("pagehide", () => {
+    running = false;
+    if (scanTimer) clearInterval(scanTimer);
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (worker) worker.terminate();
+  });
+})();
+</script>
+</body>
+</html>
